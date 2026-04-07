@@ -1,322 +1,237 @@
-"""
-    run_calc_attack.jl
-
-High-level orchestration script for computing worst-case attack outcomes.
-Julia port of MATLAB run_calc_attack.m.
-
-Iterates over all lines (both flow directions) and all buses (min/max voltage)
-to find the worst-case impacts of compromised generators.
-
-Usage:
-    julia --project=.. run_calc_attack.jl
-
-Or from Julia REPL:
-    include("run_calc_attack.jl")
-    results = run_attack_analysis("../hawaii40.m", collect(ngen-9:ngen))
-"""
+## Calculate the worst-case line flows and voltage magnitudes for a given set of compromised generators
+# Julia port of run_calc_attack.m — direct script translation
 
 using PowerModels
 using JuMP
 using Ipopt
 using Printf
+using Plots
 
 include("calc_attack.jl")
 
-"""
-    run_attack_analysis(case_path, compromised_gens;
-                        pvpq_k=100.0, pf=0.95, optimizer=Ipopt.Optimizer, verbose=false)
+verbose = false  # Display solver output?
 
-Run complete attack analysis on a power system case.
+###############################################################################
+## Load test case
+###############################################################################
+data = PowerModels.parse_file("hawaii40_with_solar.m")
 
-# Arguments
-- `case_path`: Path to MATPOWER case file
-- `compromised_gens`: Vector of generator indices that are compromised
-
-# Keyword Arguments
-- `pvpq_k`: Slope for PV/PQ switching S-curve (default: 100.0)
-- `pf`: Power factor for load Qd auto-fix (default: 0.95)
-- `optimizer`: JuMP optimizer (default: Ipopt.Optimizer)
-- `verbose`: Show solver output (default: false)
-
-# Returns
-Dict with:
-- `Ift`: Worst-case current magnitudes (from→to), length nbranch
-- `Itf`: Worst-case current magnitudes (to→from), length nbranch
-- `Vlow`: Worst-case minimum voltages, length nbus
-- `Vhigh`: Worst-case maximum voltages, length nbus
-- `baseline`: Baseline OPF results
-- `case_path`: Input case path
-- `compromised_gens`: Compromised generator indices
-"""
-function run_attack_analysis(case_path::String, compromised_gens::Vector{Int};
-                             pvpq_k::Float64=100.0, pf::Float64=0.95,
-                             optimizer=Ipopt.Optimizer, verbose::Bool=false)
-
-    println("=" ^ 60)
-    println("Attack Analysis: ", case_path)
-    println("=" ^ 60)
-
-    # Load case
-    println("Loading case...")
-    mpc = PowerModels.parse_file(case_path)
-
-    # Remove generators that are turned off
-    gens_to_remove = String[]
-    for (gk, gen) in mpc["gen"]
-        if get(gen, "gen_status", 1) == 0
-            push!(gens_to_remove, gk)
-        end
-    end
-    for gk in gens_to_remove
-        delete!(mpc["gen"], gk)
-    end
-    println("Removed $(length(gens_to_remove)) offline generators")
-
-    # Fix Qd if all zero (before building ref)
-    all_qd_zero = true
-    for (lk, load) in mpc["load"]
-        if get(load, "qd", 0.0) != 0.0
-            all_qd_zero = false
-            break
-        end
-    end
-    if all_qd_zero
-        println("Auto-fixing Qd with power factor $(pf)")
-        for (lk, load) in mpc["load"]
-            pd = get(load, "pd", 0.0)
-            load["qd"] = pd * sqrt((1/pf^2) - 1)
-        end
-    end
-
-    # Get dimensions using build_ref
-    pm_ref = PowerModels.build_ref(mpc)[:it][:pm][:nw][0]
-    nbus = length(pm_ref[:bus])
-    ngen = length(pm_ref[:gen])
-    nbranch = length(pm_ref[:branch])
-    baseMVA = pm_ref[:baseMVA]
-
-    println("Network: $(nbus) buses, $(ngen) generators, $(nbranch) branches")
-    println("Compromised generators: ", compromised_gens)
-
-    # Set lower generation bounds of compromised generators to zero
-    # (models ability to shut off generators)
-    gen_ids = sort(collect(keys(pm_ref[:gen])))
-    for (idx, gen_id) in enumerate(gen_ids)
-        if idx in compromised_gens
-            mpc["gen"][string(gen_id)]["pmin"] = 0.0
-        end
-    end
-
-    # Run baseline OPF to get nominal values
-    println("Running baseline OPF...")
-    baseline = PowerModels.solve_opf(mpc, ACPPowerModel, optimizer)
-
-    if baseline["termination_status"] != MOI.LOCALLY_SOLVED &&
-       baseline["termination_status"] != MOI.OPTIMAL
-        error("Baseline OPF failed: $(baseline["termination_status"])")
-    end
-    println("Baseline OPF solved successfully")
-
-    # Update mpc with baseline solution
-    for (bk, bus_sol) in baseline["solution"]["bus"]
-        if haskey(mpc["bus"], bk)
-            mpc["bus"][bk]["vm"] = bus_sol["vm"]
-            mpc["bus"][bk]["va"] = bus_sol["va"]
-        end
-    end
-    for (gk, gen_sol) in baseline["solution"]["gen"]
-        if haskey(mpc["gen"], gk)
-            mpc["gen"][gk]["pg"] = gen_sol["pg"]
-            mpc["gen"][gk]["qg"] = gen_sol["qg"]
-            # Set vg from bus voltage
-            gen_bus = mpc["gen"][gk]["gen_bus"]
-            if haskey(baseline["solution"]["bus"], string(gen_bus))
-                mpc["gen"][gk]["vg"] = baseline["solution"]["bus"][string(gen_bus)]["vm"]
-            end
-        end
-    end
-
-    # Rebuild ref after updating with baseline solution
-    pm_ref = PowerModels.build_ref(mpc)[:it][:pm][:nw][0]
-    gen_ids = sort(collect(keys(pm_ref[:gen])))
-
-    # Compute participation factors based on nominal outputs
-    Pg0 = zeros(ngen)
-    for (idx, gen_id) in enumerate(gen_ids)
-        gen = pm_ref[:gen][gen_id]
-        Pg0[idx] = gen["pg"] / baseMVA
-    end
-    Pg_total = sum(Pg0)
-    alpha = Pg_total > 0 ? Pg0 ./ Pg_total : zeros(ngen)
-
-    # Preallocate results
-    Ift = fill(NaN, nbranch)
-    Itf = fill(NaN, nbranch)
-    Vlow = fill(NaN, nbus)
-    Vhigh = fill(NaN, nbus)
-
-    # Results storage for detailed analysis
-    results_ft = Vector{Dict{String,Any}}(undef, nbranch)
-    results_tf = Vector{Dict{String,Any}}(undef, nbranch)
-    results_vlow = Vector{Dict{String,Any}}(undef, nbus)
-    results_vhigh = Vector{Dict{String,Any}}(undef, nbus)
-
-    println("\n--- Computing Worst-Case Line Flows (from→to) ---")
-    for i in 1:nbranch
-        @printf("Line %d/%d (from→to)...", i, nbranch)
-        res = calc_attack_line_ft(mpc, i, compromised_gens, alpha, pvpq_k;
-                                  optimizer=optimizer, verbose=verbose)
-        results_ft[i] = res
-        if res["success"]
-            Ift[i] = sqrt(max(res["objective"], 0.0))
-            @printf(" I = %.4f p.u.\n", Ift[i])
-        else
-            @printf(" FAILED (%s)\n", res["termination_status"])
-        end
-    end
-
-    println("\n--- Computing Worst-Case Line Flows (to→from) ---")
-    for i in 1:nbranch
-        @printf("Line %d/%d (to→from)...", i, nbranch)
-        res = calc_attack_line_tf(mpc, i, compromised_gens, alpha, pvpq_k;
-                                  optimizer=optimizer, verbose=verbose)
-        results_tf[i] = res
-        if res["success"]
-            Itf[i] = sqrt(max(res["objective"], 0.0))
-            @printf(" I = %.4f p.u.\n", Itf[i])
-        else
-            @printf(" FAILED (%s)\n", res["termination_status"])
-        end
-    end
-
-    println("\n--- Computing Worst-Case Minimum Voltages ---")
-    for i in 1:nbus
-        @printf("Bus %d/%d (min V)...", i, nbus)
-        res = calc_attack_voltage_min(mpc, i, compromised_gens, alpha, pvpq_k;
-                                      optimizer=optimizer, verbose=verbose)
-        results_vlow[i] = res
-        if res["success"]
-            # Objective is negative of V for minimization
-            Vlow[i] = -res["objective"]
-            @printf(" V = %.4f p.u.\n", Vlow[i])
-        else
-            @printf(" FAILED (%s)\n", res["termination_status"])
-        end
-    end
-
-    println("\n--- Computing Worst-Case Maximum Voltages ---")
-    for i in 1:nbus
-        @printf("Bus %d/%d (max V)...", i, nbus)
-        res = calc_attack_voltage_max(mpc, i, compromised_gens, alpha, pvpq_k;
-                                      optimizer=optimizer, verbose=verbose)
-        results_vhigh[i] = res
-        if res["success"]
-            Vhigh[i] = res["objective"]
-            @printf(" V = %.4f p.u.\n", Vhigh[i])
-        else
-            @printf(" FAILED (%s)\n", res["termination_status"])
-        end
-    end
-
-    # Summary
-    println("\n" * "=" ^ 60)
-    println("SUMMARY")
-    println("=" ^ 60)
-
-    valid_ift = filter(!isnan, Ift)
-    valid_itf = filter(!isnan, Itf)
-    valid_vlow = filter(!isnan, Vlow)
-    valid_vhigh = filter(!isnan, Vhigh)
-
-    if !isempty(valid_ift)
-        @printf("Max line current (f→t): %.4f p.u. at line %d\n",
-                maximum(valid_ift), argmax(Ift))
-    end
-    if !isempty(valid_itf)
-        @printf("Max line current (t→f): %.4f p.u. at line %d\n",
-                maximum(valid_itf), argmax(Itf))
-    end
-    if !isempty(valid_vlow)
-        @printf("Min voltage: %.4f p.u. at bus %d\n",
-                minimum(valid_vlow), argmin(Vlow))
-    end
-    if !isempty(valid_vhigh)
-        @printf("Max voltage: %.4f p.u. at bus %d\n",
-                maximum(valid_vhigh), argmax(Vhigh))
-    end
-
-    @printf("\nSuccess rate: %d/%d (%.1f%%)\n",
-            length(valid_ift) + length(valid_itf) + length(valid_vlow) + length(valid_vhigh),
-            2*nbranch + 2*nbus,
-            100 * (length(valid_ift) + length(valid_itf) + length(valid_vlow) + length(valid_vhigh)) / (2*nbranch + 2*nbus))
-
-    return Dict{String,Any}(
-        "Ift" => Ift,
-        "Itf" => Itf,
-        "Vlow" => Vlow,
-        "Vhigh" => Vhigh,
-        "baseline" => baseline,
-        "case_path" => case_path,
-        "compromised_gens" => compromised_gens,
-        "nbus" => nbus,
-        "ngen" => ngen,
-        "nbranch" => nbranch,
-        "results_ft" => results_ft,
-        "results_tf" => results_tf,
-        "results_vlow" => results_vlow,
-        "results_vhigh" => results_vhigh
-    )
-end
-
-"""
-    print_voltage_violations(results; v_min=0.9, v_max=1.1)
-
-Print summary of buses with voltage violations under worst-case attack.
-"""
-function print_voltage_violations(results::Dict{String,Any};
-                                  v_min::Float64=0.9, v_max::Float64=1.1)
-    Vlow = results["Vlow"]
-    Vhigh = results["Vhigh"]
-
-    println("\n--- Voltage Violations ---")
-    println("Buses with worst-case low voltage < $(v_min) p.u.:")
-    for i in 1:length(Vlow)
-        if !isnan(Vlow[i]) && Vlow[i] < v_min
-            @printf("  Bus %d: %.4f p.u.\n", i, Vlow[i])
-        end
-    end
-
-    println("\nBuses with worst-case high voltage > $(v_max) p.u.:")
-    for i in 1:length(Vhigh)
-        if !isnan(Vhigh[i]) && Vhigh[i] > v_max
-            @printf("  Bus %d: %.4f p.u.\n", i, Vhigh[i])
-        end
+# Remove generators that are turned off
+for gk in collect(keys(data["gen"]))
+    if get(data["gen"][gk], "gen_status", 1) == 0
+        delete!(data["gen"], gk)
     end
 end
 
-# Main script execution when run directly
-if abspath(PROGRAM_FILE) == @__FILE__
-    # Default: run on Hawaii40 case with last 10 generators compromised
-    case_path = joinpath(@__DIR__, "..", "hawaii40.m")
+# Get ordered generator IDs (matching MATPOWER internal ordering after ext2int)
+gen_ids    = sort([parse(Int, k) for k in keys(data["gen"])])
+branch_ids = sort([parse(Int, k) for k in keys(data["branch"])])
+bus_ids    = sort([parse(Int, k) for k in keys(data["bus"])])
 
-    if !isfile(case_path)
-        error("Case file not found: $case_path")
+nbus    = length(data["bus"])
+ngen    = length(data["gen"])
+nbranch = length(data["branch"])
+
+###############################################################################
+## Choose compromised generators
+# MATLAB: c(end-3:end) = true  ->  last 4 generators are compromised
+###############################################################################
+c = falses(ngen)
+c[end-3:end] .= true
+
+# Set the lower generation bounds of the compromised generators to zero
+# (models the ability to shut off the generators)
+for (idx, id) in enumerate(gen_ids)
+    if c[idx]
+        data["gen"][string(id)]["pmin"] = 0.0
     end
-
-    # Load case to determine number of generators
-    mpc_temp = PowerModels.parse_file(case_path)
-    ngen_temp = length(mpc_temp["gen"])
-
-    # Compromise last 10 generators (or all if fewer than 10)
-    n_compromised = min(10, ngen_temp)
-    compromised_gens = collect((ngen_temp - n_compromised + 1):ngen_temp)
-
-    println("Running attack analysis on Hawaii40 case")
-    println("Compromising generators: ", compromised_gens)
-
-    results = run_attack_analysis(case_path, compromised_gens; verbose=false)
-
-    print_voltage_violations(results)
-
-    println("\nAnalysis complete!")
 end
+
+###############################################################################
+## Make test case Qd reasonable
+# Set reactive power demand based on assumed power factor (matching MATLAB pf=0.96)
+###############################################################################
+pf = 0.96
+for (_, load) in data["load"]
+    pd = get(load, "pd", 0.0)
+    load["qd"] = pd * sqrt((1/pf^2) - 1)
+end
+
+###############################################################################
+## Run OPF to get nominal values (prior to attack)
+###############################################################################
+println("Running baseline OPF...")
+res0 = PowerModels.solve_opf(data, ACPPowerModel, Ipopt.Optimizer)
+
+# Update data with baseline OPF solution
+for (bk, bsol) in res0["solution"]["bus"]
+    haskey(data["bus"], bk) || continue
+    data["bus"][bk]["vm"] = bsol["vm"]
+    data["bus"][bk]["va"] = bsol["va"]
+end
+for (gk, gsol) in res0["solution"]["gen"]
+    haskey(data["gen"], gk) || continue
+    data["gen"][gk]["pg"] = gsol["pg"]
+    data["gen"][gk]["qg"] = gsol["qg"]
+    gen_bus = data["gen"][gk]["gen_bus"]
+    bk = string(gen_bus)
+    if haskey(res0["solution"]["bus"], bk)
+        data["gen"][gk]["vg"] = res0["solution"]["bus"][bk]["vm"]
+    end
+end
+
+###############################################################################
+## Set S-curve parameters and participation factors
+###############################################################################
+pvpq_k = 100.0  # Slope parameter for smoothed PV/PQ switching characteristic
+
+# Participation factors based on nominal active power outputs
+Pg0    = [data["gen"][string(id)]["pg"] for id in gen_ids]
+Pg_tot = sum(Pg0)
+alpha  = Pg_tot > 0 ? Pg0 ./ Pg_tot : zeros(ngen)
+
+###############################################################################
+## Find worst-case outcomes for the given set of compromised generators
+###############################################################################
+
+# Branch thermal ratings for percentage-loading calculation
+rate_a = [get(data["branch"][string(id)], "rate_a", Inf) for id in branch_ids]
+
+# Placeholder variables to store results
+Ift  = fill(NaN, nbranch)
+Itf  = fill(NaN, nbranch)
+Vlow = fill(NaN, nbus)
+Vhigh= fill(NaN, nbus)
+
+## Maximize flows in f->t direction (commented out, matching MATLAB)
+for i in 1:nbranch
+    wft = zeros(nbranch); wtf = zeros(nbranch); wv = zeros(nbus)
+    wft[i] = 1.0
+    @printf("Computing Worst-Case Flow (from -> to direction) for line %d of %d\n", i, nbranch)
+    res = calc_attack(data, wft, wtf, wv, c, alpha, pvpq_k; verbose=verbose)
+    if res["success"]
+        Ift[i] = sqrt(res["f"]) * 100 / rate_a[i]
+    end
+end
+
+## Maximize flows in t->f direction (commented out, matching MATLAB)
+for i in 1:nbranch
+    wft = zeros(nbranch); wtf = zeros(nbranch); wv = zeros(nbus)
+    wtf[i] = 1.0
+    @printf("Computing Worst-Case Flow (to -> from direction) for line %d of %d\n", i, nbranch)
+    res = calc_attack(data, wft, wtf, wv, c, alpha, pvpq_k; verbose=verbose)
+    if res["success"]
+        Itf[i] = sqrt(res["f"]) * 100 / rate_a[i]
+    end
+end
+
+max_violations = max.(Ift, Itf)
+
+## Minimize voltages
+for i in 1:nbus
+    wft = zeros(nbranch); wtf = zeros(nbranch); wv = zeros(nbus)
+    wv[i] = -1.0
+    @printf("Computing Worst-Case Lower Voltage for bus %d of %d\n", i, nbus)
+    res = calc_attack(data, wft, wtf, wv, c, alpha, pvpq_k; verbose=verbose)
+    if res["success"]
+        Vlow[i] = -res["f"]
+        println(Vlow)
+    end
+end
+
+## Maximize voltages (commented out, matching MATLAB)
+for i in 1:nbus
+    wft = zeros(nbranch); wtf = zeros(nbranch); wv = zeros(nbus)
+    wv[i] = 1.0
+    @printf("Computing Worst-Case Upper Voltage for bus %d of %d\n", i, nbus)
+    res = calc_attack(data, wft, wtf, wv, c, alpha, pvpq_k; verbose=verbose)
+    if res["success"]
+        Vhigh[i] = res["f"]
+    end
+end
+
+###############################################################################
+## Plotting — helper for shaded vertical bands (equivalent to MATLAB patch)
+###############################################################################
+
+# Add a shaded rectangle between x1 and x2 spanning full plot height.
+# Call this AFTER the histogram so ylims are set.
+function vband!(p, x1, x2, color; fillalpha=0.12, label="")
+    yl_lo, yl_hi = ylims(p)
+    plot!(p, Shape([x1, x2, x2, x1], [yl_lo, yl_lo, yl_hi, yl_hi]);
+          fillcolor=color, fillalpha=fillalpha,
+          linewidth=0, linecolor=:transparent, label=label)
+    ylims!(p, yl_lo, yl_hi)  # Restore y limits so the shape doesn't expand the axes
+end
+
+###############################################################################
+## Plotting — Line violations
+# Requires the line flow loops above to be uncommented.
+###############################################################################
+if !all(isnan.(Ift)) || !all(isnan.(Itf))
+    max_violations = max.(Ift, Itf)
+    valid_mv = filter(!isnan, max_violations)
+    xl_lo = minimum(valid_mv)
+    xl_hi = maximum(valid_mv)
+
+    pL = histogram(max_violations; bins=20,
+                   color=:gray, fillalpha=0.7, label="",
+                   title="Worst-Case Line Loading", titlefontsize=14,
+                   xlabel="Percentage loading (%)", ylabel="Number of branches",
+                   labelfontsize=14, grid=true, legend=:topright)
+
+    vband!(pL, xl_lo, 100.0,  :blue; label="Normal operation")
+    vband!(pL, 100.0,  xl_hi,  :red;  label="Constraint violation")
+    vline!([100.0]; color=:red, linestyle=:dash, linewidth=2, label="")
+
+    display(pL)
+end
+
+###############################################################################
+## Plotting — Voltage violations (two stacked subplots)
+###############################################################################
+valid_vhigh = filter(!isnan, Vhigh)
+valid_vlow  = filter(!isnan, Vlow)
+
+# Top panel: Overvoltage (Vhigh)
+# Uncomment the Vhigh loop above to populate this panel.
+if isempty(valid_vhigh)
+    p1 = plot(; title="Worst-Case Overvoltage\n(uncomment Vhigh loop to run)",
+               titlefontsize=14, grid=true)
+else
+    x1_hi = maximum(valid_vhigh)
+    p1 = histogram(Vhigh; bins=20,
+                   color=:gray, fillalpha=0.7, label="",
+                   title="Worst-Case Overvoltage", titlefontsize=16,
+                   xlabel="Voltage (p.u.)", ylabel="Number of buses",
+                   labelfontsize=14, grid=true, legend=:topleft)
+
+    vband!(p1, 1.00, 1.05,   RGB(0.3, 0.6, 1.0); label="Normal operation")
+    vband!(p1, 1.05, x1_hi,  RGB(1.0, 0.4, 0.4); label="Constraint violation")
+    vline!([1.05]; color=:red,  linestyle=:dash, linewidth=2, label="")
+    vline!([1.00]; color=:blue, linewidth=1.2,               label="")
+end
+
+# Bottom panel: Undervoltage (Vlow)
+if isempty(valid_vlow)
+    p2 = plot(; title="Worst-Case Undervoltage\n(uncomment Vlow loop to run)",
+               titlefontsize=14, grid=true)
+else
+    x2_lo = minimum(valid_vlow)
+    p2 = histogram(Vlow; bins=20,
+                   color=:gray, fillalpha=0.7, label="",
+                   title="Worst-Case Undervoltage", titlefontsize=16,
+                   xlabel="Voltage (p.u.)", ylabel="Number of buses",
+                   labelfontsize=14, grid=true, legend=:topright)
+
+    vband!(p2, x2_lo, 0.95,  RGB(1.0, 0.4, 0.4); label="Constraint violation")
+    vband!(p2, 0.95,  1.00,  RGB(0.3, 0.6, 1.0); label="Normal operation")
+    vline!([0.95]; color=:red,  linestyle=:dash, linewidth=2, label="")
+    vline!([1.00]; color=:blue, linewidth=1.2,               label="")
+end
+
+p_volt = plot(p1, p2;
+              layout=(2, 1), size=(800, 800),
+              plot_title="Worst-Case Voltage Analysis — Distributions",
+              plot_titlefontsize=18)
+display(p_volt)
