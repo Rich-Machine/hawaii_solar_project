@@ -28,13 +28,10 @@ attacker can induce by coordinated control of the compromised DERs
 │   └── optimal_scurve_k_asym_brute_force.m   AGC sigmoid-fit helper
 │
 ├── calc_attack_julia/                Julia port of the attack optimization (JuMP + Ipopt)
-│   ├── calc_attack.jl
-│   ├── run_calc_attack.jl
-│   └── attack_utils.jl
-│
-├── opt_pmd_volt.jl                   Baseline OPF experiment with relaxed voltage bounds
-├── spoofing_attack.jl                Alternative attack formulation (voltage/angle spoofing)
-└── voltage_{angle,magnitude}_spoofing_attack.pdf   Reference output figures
+  ├── calc_attack.jl
+  ├── run_calc_attack.jl
+  └── attack_utils.jl
+
 ```
 
 ## Pipeline
@@ -75,6 +72,6 @@ Julia:
 julia --project=. calc_attack_julia/run_calc_attack.jl
 ```
 
-Both drivers load `hawaii40_with_solar.m`, solve a baseline OPF, loop over
+Both drivers load `hawaii40_with_solar.m`, solve a baseline OPF, and loop over
 each bus (voltage targets) and each line (flow targets), and produce the
 worst-case histograms.
